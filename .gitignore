@@ -18,3 +18,4 @@
 .attach_pid*
 hs_err_pid*.log
 *.sh
+ConnectorJ 80.iml

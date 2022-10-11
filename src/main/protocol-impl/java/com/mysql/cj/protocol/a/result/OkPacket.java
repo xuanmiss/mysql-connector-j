@@ -62,9 +62,9 @@ public class OkPacket implements ProtocolEntity {
         ok.setInfo(buf.readString(StringSelfDataType.STRING_TERM, errorMessageEncoding)); // info
 
         // read session state changes info
-        if ((ok.getStatusFlags() & SERVER_SESSION_STATE_CHANGED) > 0) {
-            ok.sessionStateChanges.init(buf, errorMessageEncoding);
-        }
+//        if ((ok.getStatusFlags() & SERVER_SESSION_STATE_CHANGED) > 0) {
+//            ok.sessionStateChanges.init(buf, errorMessageEncoding);
+//        }
         return ok;
     }
 
