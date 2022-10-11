@@ -11448,7 +11448,7 @@ public class StatementRegressionTest extends BaseTestCase {
             st.setQueryTimeout(2);
 
             PreparedStatement ps = con.prepareStatement("update testBug20391550 set c2=? where c1=?");
-            assertThrows(SQLException.class, "Statement cancelled due to timeout or client request", () -> st.executeQuery("select sleep(3)"));
+            assertThrows(SQLException.class, "Statement cancelled due to timeout or client request", () -> st.executeQuery("select sleep(8)"));
 
             assertThrows(SQLException.class, "No operations allowed after statement closed.", () -> {
                 ps.setInt(2, 100);
@@ -11576,16 +11576,14 @@ public class StatementRegressionTest extends BaseTestCase {
             PreparedStatement ps = con.prepareStatement("SHOW CREATE TABLE testBug103878");
             this.rs = ps.executeQuery();
             assertTrue(this.rs.next());
-            assertTrue(this.rs.getString(2).startsWith("CREATE TABLE"));
-            System.out.println(this.rs.getString(2));
+            assertTrue(StringUtils.startsWithIgnoreCase(this.rs.getString(2), "CREATE TABLE"));
             ps.close();
 
             ps = con.prepareStatement("SHOW CREATE VIEW testBug103878_view");
             this.rs = ps.executeQuery();
             assertTrue(this.rs.next());
-            assertTrue(this.rs.getString(2).startsWith("CREATE"));
-            assertTrue(this.rs.getString(2).contains("testBug103878_view"));
-            System.out.println(this.rs.getString(2));
+            assertTrue(StringUtils.startsWithIgnoreCase(this.rs.getString(2), "CREATE"));
+            assertTrue(StringUtils.indexOfIgnoreCase(this.rs.getString(2), "testBug103878_view") >= 0);
             ps.close();
 
             ps = con.prepareStatement("SHOW PROCESSLIST");
@@ -11599,8 +11597,7 @@ public class StatementRegressionTest extends BaseTestCase {
                 ps = con.prepareStatement("SHOW CREATE USER testBug103878User");
                 this.rs = ps.executeQuery();
                 assertTrue(this.rs.next());
-                assertTrue(this.rs.getString(1).startsWith("CREATE USER"));
-                System.out.println(this.rs.getString(1));
+                assertTrue(StringUtils.startsWithIgnoreCase(this.rs.getString(1), "CREATE USER"));
                 ps.close();
             }
         } finally {
@@ -11963,35 +11960,38 @@ public class StatementRegressionTest extends BaseTestCase {
     public void testBug99260() throws Exception {
         assumeTrue(versionMeetsMinimum(5, 7), "MySQL 5.7+ is required to run this test.");
 
-        Supplier<Integer> sessionCount = () -> {
-            try {
-                this.stmt.execute("FLUSH STATUS");
-                this.rs = this.stmt.executeQuery("SHOW STATUS LIKE 'threads_connected'");
-                this.rs.next();
-                return this.rs.getInt(2);
-            } catch (SQLException e) {
-                throw new RuntimeException(e.getMessage(), e);
-            }
-        };
-
-        int initialSessionCount = sessionCount.get();
-
         Properties props = new Properties();
         props.setProperty(PropertyKey.sslMode.getKeyName(), SslMode.DISABLED.name());
         props.setProperty(PropertyKey.allowPublicKeyRetrieval.getKeyName(), "true");
 
         Connection testConn = getConnectionWithProps(props);
-        Statement testStmt = testConn.createStatement();
+        long threadId = ((JdbcConnection) testConn).getId();
+        Supplier<Integer> sessionCount = () -> { // Counts sessions created since the main connection.
+            try (Statement testStmt = testConn.createStatement()) {
+                int c = 0;
+                testStmt.execute("FLUSH STATUS");
+                this.rs = testStmt.executeQuery("SHOW PROCESSLIST");
+                while (this.rs.next()) {
+                    if (this.rs.getInt(1) > threadId) {
+                        c++;
+                    }
+                }
+                return c;
+            } catch (SQLException e) {
+                throw new RuntimeException(e.getMessage(), e);
+            }
+        };
 
+        assertEquals(0, sessionCount.get());
+
+        Statement testStmt = testConn.createStatement();
         testStmt.setQueryTimeout(1);
         for (int i = 0; i < 5; i++) {
             assertThrows(MySQLTimeoutException.class, "Statement cancelled due to timeout or client request", () -> {
                 testStmt.executeQuery("SELECT SLEEP(30)");
                 return null;
             });
-            // The difference between the `initialSessionCount` and the current session count would be greater than one if connections external to this test are
-            // created in between. Chances for this to happen in a controlled or development environment are very low and can be neglected. 
-            assertEquals(1, sessionCount.get() - initialSessionCount);
+            assertEquals(0, sessionCount.get());
         }
 
         testConn.close();
@@ -12379,5 +12379,295 @@ public class StatementRegressionTest extends BaseTestCase {
 
         this.stmt.execute("TRUNCATE TABLE testBug21978230");
         runQueryAndAssertResults.accept("INSERT INTO testBug21978230 VALUES(?, ?, /* comment */CONCAT(?, '^^^^', ?))");
+    }
+
+    /**
+     * Tests for Bug#76623 (20856749), JDBC driver misinterprets "--" as a comment, instead of "-- ".
+     * 
+     * Fixed in Connector/J 8.0.27 under fix for Bug#71929 (18346501), Prefixing query with double comments cancels query DML validation.
+     * 
+     * @throws Exception
+     */
+    @Test
+    public void testBug76623() throws Exception {
+        this.rs = this.stmt.executeQuery("SELECT 1--2");
+        assertTrue(this.rs.next());
+        assertEquals(3, this.rs.getInt(1));
+
+        this.rs = this.stmt.executeQuery("SELECT 1 --2");
+        assertTrue(this.rs.next());
+        assertEquals(3, this.rs.getInt(1));
+
+        this.rs = this.stmt.executeQuery("SELECT 1 - -2");
+        assertTrue(this.rs.next());
+        assertEquals(3, this.rs.getInt(1));
+
+        this.rs = this.stmt.executeQuery("SELECT 1-- 2");
+        assertTrue(this.rs.next());
+        assertEquals(1, this.rs.getInt(1));
+
+        this.rs = this.stmt.executeQuery("SELECT 1 -- 2");
+        assertTrue(this.rs.next());
+        assertEquals(1, this.rs.getInt(1));
+
+        boolean useSPS = false;
+        do {
+            String expectedErrMsg = useSPS ? "No parameters specified during prepareStatement\\(\\) or prepareCall\\(\\)"
+                    : "Parameter index out of range \\(1 > number of parameters, which is 0\\)\\.";
+
+            Properties props = new Properties();
+            props.setProperty(PropertyKey.useServerPrepStmts.getKeyName(), Boolean.toString(useSPS));
+            Connection testConn = getConnectionWithProps(props);
+
+            this.pstmt = testConn.prepareStatement("SELECT 1--2 + ?");
+            this.pstmt.setInt(1, 3);
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(6, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 --2 + ?");
+            this.pstmt.setInt(1, 3);
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(6, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 - -2 + ?");
+            this.pstmt.setInt(1, 3);
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(6, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1-- 2 + ?");
+            assertThrows(SQLException.class, expectedErrMsg, () -> {
+                this.pstmt.setInt(1, 3);
+                return null;
+            });
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(1, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 -- 2 + ?");
+            assertThrows(SQLException.class, expectedErrMsg, () -> {
+                this.pstmt.setInt(1, 3);
+                return null;
+            });
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(1, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 -- 2--?");
+            assertThrows(SQLException.class, expectedErrMsg, () -> {
+                this.pstmt.setInt(1, 3);
+                return null;
+            });
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(1, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 -- 2 --?");
+            assertThrows(SQLException.class, expectedErrMsg, () -> {
+                this.pstmt.setInt(1, 3);
+                return null;
+            });
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(1, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 -- 2 - -?");
+            assertThrows(SQLException.class, expectedErrMsg, () -> {
+                this.pstmt.setInt(1, 3);
+                return null;
+            });
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(1, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 -- 2-- ?");
+            assertThrows(SQLException.class, expectedErrMsg, () -> {
+                this.pstmt.setInt(1, 3);
+                return null;
+            });
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(1, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 -- 2 -- ?");
+            assertThrows(SQLException.class, expectedErrMsg, () -> {
+                this.pstmt.setInt(1, 3);
+                return null;
+            });
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(1, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 - -2--?");
+            this.pstmt.setInt(1, 3);
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(6, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 - -2 --?");
+            this.pstmt.setInt(1, 3);
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(6, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 - -2 - -?");
+            this.pstmt.setInt(1, 3);
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(6, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 - -2-- ?");
+            assertThrows(SQLException.class, expectedErrMsg, () -> {
+                this.pstmt.setInt(1, 3);
+                return null;
+            });
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(3, this.rs.getInt(1));
+
+            this.pstmt = testConn.prepareStatement("SELECT 1 - -2 -- ?");
+            assertThrows(SQLException.class, expectedErrMsg, () -> {
+                this.pstmt.setInt(1, 3);
+                return null;
+            });
+            this.rs = this.pstmt.executeQuery();
+            assertTrue(this.rs.next());
+            assertEquals(3, this.rs.getInt(1));
+
+            testConn.close();
+        } while (useSPS = !useSPS);
+    }
+
+    /**
+     * Tests fix for Bug#104753 (Bug#33286177), PreparedStatement.setFetchSize(0) causes ArrayIndexOutOfBoundsException.
+     * 
+     * @throws Exception
+     */
+    @Test
+    public void testBug104753() throws Exception {
+        createTable("testBug104753", "(id BIGINT NOT NULL, PRIMARY KEY (id))");
+
+        Consumer<Integer> runQuery = (f) -> { // fetchSize
+            try {
+                this.pstmt.setFetchSize(f);
+                this.pstmt.execute();
+                this.rs = this.pstmt.getResultSet();
+                assertTrue(this.rs.next());
+                assertEquals(1, this.rs.getInt(1));
+            } catch (Throwable e) {
+                fail("Exception not expected");
+            }
+        };
+
+        this.stmt.executeUpdate("INSERT INTO testBug104753 VALUES (1)");
+
+        Properties props = new Properties();
+        props.setProperty(PropertyKey.sslMode.getKeyName(), SslMode.DISABLED.name());
+        props.setProperty(PropertyKey.allowPublicKeyRetrieval.getKeyName(), "true");
+        props.setProperty(PropertyKey.useServerPrepStmts.getKeyName(), "true");
+        props.setProperty(PropertyKey.useCursorFetch.getKeyName(), "true");
+
+        // With prepared statements cache, COM_STMT_RESET sent.
+        props.setProperty(PropertyKey.cachePrepStmts.getKeyName(), "true");
+        Connection testConn = getConnectionWithProps(props);
+
+        this.pstmt = testConn.prepareStatement("SELECT id FROM testBug104753");
+        runQuery.accept(0);
+        this.pstmt.close();
+        this.pstmt = testConn.prepareStatement("SELECT id FROM testBug104753");
+        runQuery.accept(1);
+        this.pstmt.close();
+        this.pstmt = testConn.prepareStatement("SELECT id FROM testBug104753");
+        runQuery.accept(0);
+        this.pstmt.close();
+        this.pstmt = testConn.prepareStatement("SELECT id FROM testBug104753");
+        runQuery.accept(0);
+        this.pstmt.close();
+        this.pstmt = testConn.prepareStatement("SELECT id FROM testBug104753");
+        runQuery.accept(1);
+        this.pstmt.close();
+
+        testConn.close();
+
+        // No prepared statements cache, no COM_STMT_RESET sent.
+        props.setProperty(PropertyKey.cachePrepStmts.getKeyName(), "false");
+        testConn = getConnectionWithProps(props);
+
+        this.pstmt = testConn.prepareStatement("SELECT id FROM testBug104753");
+        runQuery.accept(0);
+        runQuery.accept(1);
+        runQuery.accept(0);
+        runQuery.accept(0);
+        runQuery.accept(1);
+
+        testConn.close();
+    }
+
+    /**
+     * Tests fix for Bug#107222 (Bug#34150112), ClientPreparedStatement.toString() no longer interpolates byte arrays.
+     * 
+     * @throws Exception
+     */
+    @Test
+    public void testBug107222() throws Exception {
+        boolean useSPS = false;
+        boolean setMax = false;
+
+        createTable("testBug107222", "(b1 VARBINARY(100), b2 VARBINARY(100), i1 INT)");
+        do {
+            Properties props = new Properties();
+            props.setProperty(PropertyKey.sslMode.getKeyName(), SslMode.DISABLED.name());
+            props.setProperty(PropertyKey.allowPublicKeyRetrieval.getKeyName(), "true");
+            props.setProperty(PropertyKey.useServerPrepStmts.getKeyName(), Boolean.toString(useSPS));
+            if (setMax) {
+                props.setProperty(PropertyKey.maxByteArrayAsHex.getKeyName(), "10");
+            }
+            Connection testConn = getConnectionWithProps(props);
+
+            final String testCase = String.format("Case [SPS: %s, SetMax: %s]", useSPS ? "Y" : "N", setMax ? "Y" : "N");
+            String expectedInterpolation = setMax ? "** BYTE ARRAY DATA **" : "x'4d7953514c20436f6e6e6563746f722f4a'";
+
+            this.pstmt = testConn.prepareStatement("INSERT INTO testBug107222 VALUES (?, ?, ?)");
+            this.pstmt.setBytes(1, "MySQL Connector/J".getBytes());
+            this.pstmt.setString(2, null);
+            this.pstmt.setNull(3, Types.INTEGER);
+            this.pstmt.execute();
+
+            String sql = this.pstmt.unwrap(JdbcPreparedStatement.class).toString();
+            int startPos = sql.indexOf("testBug107222");
+            assertTrue(startPos > 0, testCase);
+            int pos = sql.indexOf(expectedInterpolation, startPos);
+            assertTrue(pos > 0, testCase);
+            startPos = pos + expectedInterpolation.length();
+            pos = sql.indexOf("NULL", startPos);
+            assertTrue(pos > 0, testCase);
+            startPos = pos + "NULL".length();
+            pos = sql.indexOf("NULL", startPos);
+            assertTrue(pos > 0, testCase);
+            startPos = pos + "NULL".length();
+            assertEquals(-1, sql.indexOf("NULL", startPos), testCase);
+
+            this.pstmt = testConn.prepareStatement("SELECT ?, ?, ?");
+            this.pstmt.setString(1, null);
+            this.pstmt.setBytes(2, "MySQL Connector/J".getBytes());
+            this.pstmt.setNull(3, Types.BOOLEAN);
+            this.pstmt.executeQuery();
+
+            sql = this.pstmt.unwrap(JdbcPreparedStatement.class).toString();
+            startPos = sql.indexOf("SELECT");
+            assertTrue(startPos > 0, testCase);
+            pos = sql.indexOf("NULL", startPos);
+            assertTrue(pos > 0, testCase);
+            startPos = pos + "NULL".length();
+            pos = sql.indexOf(expectedInterpolation, startPos);
+            assertTrue(pos > 0, testCase);
+            startPos = pos + expectedInterpolation.length();
+            pos = sql.indexOf("NULL", startPos);
+            assertTrue(pos > 0, testCase);
+            startPos = pos + "NULL".length();
+            assertEquals(-1, sql.indexOf("NULL", startPos), testCase);
+        } while ((useSPS = !useSPS) && (setMax = !setMax));
     }
 }
